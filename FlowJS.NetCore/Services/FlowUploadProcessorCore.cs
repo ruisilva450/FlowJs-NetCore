@@ -1,0 +1,185 @@
+﻿using Microsoft.AspNetCore.Hosting;
+using NgFlowSample.Models;
+using System;
+using System.IO;
+using System.Net.Http;
+using System.Runtime.Caching;
+using System.Threading.Tasks;
+
+namespace ngFlowSample.Core.Services
+{
+    public class FlowUploadProcessorCore
+    {
+        //================================================================================
+        // Class Methods
+        //================================================================================
+        #region Static Methods
+        /// <summary>
+        /// Ensures the thread safety of our static methods.
+        /// </summary>
+        private static Object chunkCacheLock = new Object();
+
+        /// <summary>
+        /// Track our in progress uploads, by using a cache, we make sure we don't accumulate memory
+        /// </summary>
+        private static MemoryCache uploadChunkCache = MemoryCache.Default;
+
+        public static IWebHostEnvironment environment;
+
+        private static FileMetaData GetFileMetaData(string flowIdentifier)
+        {
+            lock (chunkCacheLock)
+            {
+                return uploadChunkCache[flowIdentifier] as FileMetaData;
+            }
+        }
+
+        /// <summary>
+        /// Keep an upload in cache for two hours after it is last used
+        /// </summary>
+        private static CacheItemPolicy DefaultCacheItemPolicy()
+        {
+            return new CacheItemPolicy()
+            {
+                SlidingExpiration = TimeSpan.FromMinutes(120)
+            };
+        }
+
+        /// <summary>
+        /// Creates a Stream Provider suitable for handling a single upload chunk.
+        /// </summary>
+        public static FlowMultipartFormDataStreamProviderCore GetMultipartProvider(string uploadPath)
+        {
+            if (String.IsNullOrEmpty(uploadPath))
+            {
+                throw new ArgumentNullException("uploadPath");
+            }
+
+            var root = Path.Combine(environment.WebRootPath, uploadPath);
+            Directory.CreateDirectory(root);
+
+            return new FlowMultipartFormDataStreamProviderCore(root);
+        }
+
+        /// <summary>
+        /// (Thread Safe) Marks a chunk as recieved.
+        /// </summary>
+        private static bool RegisterSuccessfulChunk(FlowMetaData chunkMeta)
+        {
+            FileMetaData fileMeta;
+            lock (chunkCacheLock)
+            {
+                fileMeta = GetFileMetaData(chunkMeta.FlowIdentifier);
+
+                if (fileMeta == null)
+                {
+                    fileMeta = new FileMetaData(chunkMeta);
+                    uploadChunkCache.Add(chunkMeta.FlowIdentifier, fileMeta, DefaultCacheItemPolicy());
+                }
+
+                fileMeta.RegisterChunkAsReceived(chunkMeta);
+                if (fileMeta.IsComplete)
+                {
+                    // Since we are using a cache and memory is automatically disposed,
+                    // we don't need to do this, so we won't so we can keep a record of
+                    // our completed uploads.
+                    //uploadChunkCache.Remove(chunkMeta.FlowIdentifier);
+                }
+            }
+            return fileMeta.IsComplete;
+        }
+
+        public static bool HasRecievedChunk(FlowMetaData chunkMeta)
+        {
+            var fileMeta = GetFileMetaData(chunkMeta.FlowIdentifier);
+
+            bool wasRecieved = fileMeta != null && fileMeta.HasChunk(chunkMeta);
+
+            return wasRecieved;
+        }
+        #endregion
+        //================================================================================
+        // Instance Methods
+        //================================================================================
+        #region Instance Methods
+        private FlowMultipartFormDataStreamProviderCore StreamProvider { get; set; }
+
+        public FlowMetaData MetaData
+        {
+            get { return this.StreamProvider.MetaData; }
+        }
+
+        public bool IsComplete { get; private set; }
+
+        public DateTime CompletedDateTime { get; private set; }
+
+        public FlowUploadProcessorCore(IWebHostEnvironment _environment, string uploadPath)
+        {
+            environment = _environment;
+            StreamProvider = GetMultipartProvider(uploadPath);
+
+        }
+
+        public async Task<bool> ProcessUploadChunkRequest(HttpRequestMessage request)
+        {
+            await request.Content.ReadAsMultipartAsync(StreamProvider);
+
+            IsComplete = RegisterSuccessfulChunk(MetaData);
+
+            if (IsComplete)
+            {
+                CompletedDateTime = DateTime.Now;
+            }
+
+            return IsComplete;
+        }
+        #endregion
+    }
+
+    /// <summary>
+    /// Our own internal metadata to track the progress of a download. 
+    /// </summary>
+    class FileMetaData
+    {
+        private static long ChunkIndex(long chunkNumber)
+        {
+            return chunkNumber - 1;
+        }
+
+        public FileMetaData(FlowMetaData flowMeta)
+        {
+            FlowMeta = flowMeta;
+            ChunkArray = new bool[flowMeta.FlowTotalChunks];
+            TotalChunksReceived = 0;
+        }
+
+        public bool[] ChunkArray { get; set; }
+
+        /// <summary>
+        /// Chunks can come out of order, so we must track how many chunks 
+        /// we have successfully recieved to determine if the download is complete.
+        /// </summary>
+        public int TotalChunksReceived { get; set; }
+
+        public FlowMetaData FlowMeta { get; set; }
+
+        public bool IsComplete
+        {
+            get
+            {
+                return (TotalChunksReceived == FlowMeta.FlowTotalChunks);
+            }
+        }
+
+        public void RegisterChunkAsReceived(FlowMetaData flowMeta)
+        {
+            ChunkArray[ChunkIndex(flowMeta.FlowChunkNumber)] = true;
+            TotalChunksReceived++;
+        }
+
+        public bool HasChunk(FlowMetaData flowMeta)
+        {
+            return ChunkArray[ChunkIndex(flowMeta.FlowChunkNumber)];
+        }
+    }
+}
